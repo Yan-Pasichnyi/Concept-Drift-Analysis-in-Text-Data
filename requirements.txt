@@ -1,0 +1,5 @@
+river
+scikit-learn
+pandas
+matplotlib
+jupyter
