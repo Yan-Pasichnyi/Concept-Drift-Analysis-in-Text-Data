@@ -49,5 +49,4 @@ def run_comparison(file_path):
 
 
 if __name__ == "__main__":
-    # Test on gradual drift dataset
     run_comparison('../data/adanen_streams/20ng_gradual.data')
