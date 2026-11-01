@@ -120,7 +120,7 @@ To check if the adaptation helps, I also ran the same Hoeffding Tree without any
 └── README.md
 ```
 
-## Getting Started
+## Getting Started 
 
 1. Clone this repository:
    ```bash
