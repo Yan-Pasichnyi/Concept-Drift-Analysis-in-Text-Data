@@ -4,3 +4,4 @@ pandas
 matplotlib
 jupyter
 numpy
+sentence-transformers

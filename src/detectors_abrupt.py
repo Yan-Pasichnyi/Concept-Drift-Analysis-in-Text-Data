@@ -1,52 +1,24 @@
-from river import tree, metrics, drift
-from data_loader import load_adanen_stream, stream_generator
+from evaluation import get_detectors, evaluate_stream, evaluate_detection_quality
 
 
-def evaluate_detector(file_path, detector, detector_name):
-    stream = load_adanen_stream(file_path)
+def main():
+    print("--- ABRUPT DRIFT (20NG + BGE + HoeffdingTree) ---")
+    print(f"{'Detector':<14} {'Accuracy':>9} {'Macro-F1':>9} {'Resets':>7} {'Found':>7} {'Delay':>7} {'Rep':>5} {'Out':>5}")
 
-    # init model and multiple metrics
-    model = tree.HoeffdingTreeClassifier()
-    acc = metrics.Accuracy()
-    f1 = metrics.MacroF1()
+    # baseline without detector
+    base = evaluate_stream(mode='abrupt', detector=None)
+    print(f"{'No detector':<14} {base['accuracy']:>8.2f}% {base['macro_f1']:>8.2f}% {0:>7} {'-':>7} {'-':>7} {'-':>5} {'-':>5}")
 
-    drifts = []
-
-    for i, (x, y) in enumerate(stream_generator(stream)):
-        y_pred = model.predict_one(x)
-        model.learn_one(x, y)
-
-        if y_pred is not None:
-            # update both metrics
-            acc.update(y, y_pred)
-            f1.update(y, y_pred)
-
-            error = 0 if y_pred == y else 1
-            detector.update(error)
-
-            if detector.drift_detected:
-                drifts.append(i)
-                # reset model
-                model = tree.HoeffdingTreeClassifier()
-
-    print(f"[{detector_name}] Final Acc: {acc}, F1: {f1}")
-    print(f"[{detector_name}] Total drifts found: {len(drifts)}\n")
-    return drifts
-
-
-def run_comparison(file_path):
-    print(f"Starting comparison on dataset: {file_path}\n")
-
-    detectors = {
-        "ADWIN": drift.ADWIN(),
-        "DDM": drift.binary.DDM(),
-        "EDDM": drift.binary.EDDM(),
-        "Page-Hinkley": drift.PageHinkley()
-    }
-
-    for name, det in detectors.items():
-        evaluate_detector(file_path, det, name)
+    # compare drift detectors
+    for name, detector in get_detectors().items():
+        res = evaluate_stream(mode='abrupt', detector=detector)
+        q = evaluate_detection_quality(res['drifts'])
+        found_str = f"{q['found']}/{q['total_true']}"
+        print(
+            f"{name:<14} {res['accuracy']:>8.2f}% {res['macro_f1']:>8.2f}% "
+            f"{q['resets']:>7} {found_str:>7} {q['mean_delay']:>7.1f} {q['repeated']:>5} {q['outside']:>5}"
+        )
 
 
 if __name__ == "__main__":
-    run_comparison('../data/adanen_streams/20ng_abrupt.data')
+    main()
