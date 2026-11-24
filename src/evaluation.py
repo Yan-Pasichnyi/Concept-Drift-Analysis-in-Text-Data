@@ -1,5 +1,18 @@
-from river import tree, metrics, drift, utils
-from data_loader import stream_generator, TRUE_DRIFTS
+import bisect
+from collections import Counter, deque
+
+import numpy as np
+from river import tree, metrics, drift
+from sklearn.metrics import f1_score
+
+from data_loader import (
+    stream_generator, load_stream_arrays,
+    TRUE_DRIFTS, DRIFT_ZONE, DRIFT_SCHEDULE,
+)
+
+# Smaller than the 500 distance between true drifts, so the windows
+# [t, t + tolerance) never touch each other.
+DEFAULT_TOLERANCE = 400
 
 
 def get_detectors():
@@ -12,76 +25,149 @@ def get_detectors():
     }
 
 
-def evaluate_stream(mode='abrupt', detector=None, window_size=500, cache_path='../data/bge_20ng_cache.npz'):
-    model = tree.HoeffdingTreeClassifier()
-    acc = metrics.Accuracy()
-    f1 = metrics.MacroF1()
-    rolling_acc = utils.Rolling(metrics.Accuracy, window_size=window_size)
+def new_model():
+    return tree.HoeffdingTreeClassifier()
 
-    acc_history = []
-    drifts = []
 
-    for i, (x, y) in enumerate(stream_generator(mode=mode, cache_path=cache_path)):
+def _summarize(y_true, y_pred, window_size):
+    window = deque(maxlen=window_size)
+    rolling_sum = 0
+    history = []
+    eval_true, eval_pred = [], []
+    zone_correct = zone_total = 0
+    zone_start, zone_end = DRIFT_ZONE
+
+    for i, (t, p) in enumerate(zip(y_true, y_pred)):
+        if p is None:
+            history.append(np.nan)
+            continue
+        ok = int(t == p)
+        if len(window) == window.maxlen:
+            rolling_sum -= window[0]
+        window.append(ok)
+        rolling_sum += ok
+        history.append(100.0 * rolling_sum / len(window))
+
+        eval_true.append(t)
+        eval_pred.append(p)
+        if zone_start <= i < zone_end:
+            zone_total += 1
+            zone_correct += ok
+
+    n = len(eval_true)
+    accuracy = 100.0 * sum(int(t == p) for t, p in zip(eval_true, eval_pred)) / n if n else float('nan')
+    macro_f1 = 100.0 * f1_score(eval_true, eval_pred, average='macro', zero_division=0) if n else float('nan')
+    zone_accuracy = 100.0 * zone_correct / zone_total if zone_total else float('nan')
+
+    return {
+        'accuracy': accuracy,
+        'macro_f1': macro_f1,
+        'zone_accuracy': zone_accuracy,   # only the drift zone [4000, 12000)
+        'acc_history': history,           # rolling accuracy, NaN where no prediction exists
+        'n_evaluated': n,
+    }
+
+
+def evaluate_stream(mode='abrupt', detector=None, seed=42, window_size=500,
+                    reset_at=None, cache_path=None):
+    reset_at = set(reset_at or [])
+    model = new_model()
+    river_f1 = metrics.MacroF1()  # kept only to compare with sklearn Macro-F1
+
+    y_true, y_pred_all, drifts = [], [], []
+
+    for i, (x, y) in enumerate(stream_generator(mode=mode, seed=seed, cache_path=cache_path)):
+        if i in reset_at:
+            model = new_model()
+
         # test-then-train
         y_pred = model.predict_one(x)
         model.learn_one(x, y)
 
-        if y_pred is not None:
-            acc.update(y, y_pred)
-            f1.update(y, y_pred)
-            rolling_acc.update(y, y_pred)
-            acc_history.append(rolling_acc.get() * 100)
+        y_true.append(y)
+        y_pred_all.append(y_pred)
 
-            if detector is not None:
-                error = 0 if y_pred == y else 1
-                detector.update(error)
+        if y_pred is None:
+            continue
 
-                if detector.drift_detected:
-                    drifts.append(i)
-                    # reset classifier after drift
-                    model = tree.HoeffdingTreeClassifier()
-        else:
-            acc_history.append(0.0)
+        river_f1.update(y, y_pred)
 
-    return {
-        'accuracy': acc.get() * 100,
-        'macro_f1': f1.get() * 100,
-        'drifts': drifts,
-        'acc_history': acc_history,
-    }
+        if detector is not None:
+            error = 0 if y_pred == y else 1
+            detector.update(error)
+
+            if detector.drift_detected:
+                drifts.append(i)
+                # reset classifier after drift
+                model = new_model()
+
+    result = _summarize(y_true, y_pred_all, window_size)
+    result['macro_f1_river'] = river_f1.get() * 100
+    result['drifts'] = drifts
+    result['y_true'] = y_true
+    result['y_pred'] = y_pred_all
+    return result
 
 
-def evaluate_detection_quality(detected_drifts, true_drifts=TRUE_DRIFTS, tolerance=500):
-    found_delays = {}
+def evaluate_majority(mode='abrupt', seed=42, window_size=500, cache_path=None):
+    _, labels, _ = load_stream_arrays(mode, seed, cache_path)
+    counts = Counter()
+    y_true, y_pred = [], []
+
+    for y in labels.tolist():
+        y_pred.append(counts.most_common(1)[0][0] if counts else None)
+        y_true.append(y)
+        counts[y] += 1
+
+    result = _summarize(y_true, y_pred, window_size)
+    result['drifts'] = []
+    result['y_true'] = y_true
+    result['y_pred'] = y_pred
+    return result
+
+
+def evaluate_oracle(mode='abrupt', seed=42, window_size=500, cache_path=None):
+    result = evaluate_stream(mode=mode, detector=None, seed=seed, window_size=window_size,
+                             reset_at=TRUE_DRIFTS, cache_path=cache_path)
+    result['drifts'] = list(TRUE_DRIFTS)
+    return result
+
+
+def evaluate_detection_quality(detected_drifts, true_drifts=TRUE_DRIFTS, tolerance=DEFAULT_TOLERANCE):
+    true_sorted = sorted(true_drifts)
+    delays = {}
     repeated = 0
     outside = 0
 
-    for d in detected_drifts:
-        matched_drift = None
-
-        # check if detection falls within [true_drift, true_drift + tolerance)
-        for t in true_drifts:
-            if t <= d < t + tolerance:
-                matched_drift = t
-                break
-
-        if matched_drift is None:
+    for d in sorted(detected_drifts):
+        k = bisect.bisect_right(true_sorted, d) - 1
+        if k < 0 or d - true_sorted[k] >= tolerance:
             outside += 1
-        elif matched_drift not in found_delays:
-            found_delays[matched_drift] = d - matched_drift
-        else:
-            repeated += 1
+            continue
 
-    if len(found_delays) > 0:
-        mean_delay = sum(found_delays.values()) / len(found_delays)
-    else:
-        mean_delay = 0.0
+        t = true_sorted[k]
+        if t in delays:
+            repeated += 1
+        else:
+            delays[t] = d - t
+
+    mean_delay = sum(delays.values()) / len(delays) if delays else float('nan')
 
     return {
         'resets': len(detected_drifts),
-        'found': len(found_delays),
-        'total_true': len(true_drifts),
+        'found': len(delays),
+        'total_true': len(true_sorted),
         'mean_delay': mean_delay,
         'repeated': repeated,
         'outside': outside,
+        'missed': [t for t in true_sorted if t not in delays],
     }
+
+
+def label_balance_by_stage(mode='abrupt', seed=42, cache_path=None):
+    _, labels, _ = load_stream_arrays(mode, seed, cache_path)
+    starts = [stage[0] for stage in DRIFT_SCHEDULE] + [len(labels)]
+    return [
+        (starts[k], starts[k + 1], float(labels[starts[k]:starts[k + 1]].mean()))
+        for k in range(len(DRIFT_SCHEDULE))
+    ]

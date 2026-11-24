@@ -11,4 +11,7 @@ ENV/
 # Python cache
 __pycache__/
 *.py[cod]
-*.npz
+
+# cached embeddings and experiment outputs
+data/*.npz
+multi_seed_results.csv

@@ -1,7 +1,7 @@
 river
 scikit-learn
-pandas
 matplotlib
 jupyter
 numpy
 sentence-transformers
+pandas

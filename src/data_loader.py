@@ -1,8 +1,8 @@
-import os
+import bisect
 import random
+from pathlib import Path
 import numpy as np
 from sklearn.datasets import fetch_20newsgroups
-from sentence_transformers import SentenceTransformer
 
 CATEGORIES = [
     'comp.graphics', 'comp.os.ms-windows.misc', 'comp.sys.ibm.pc.hardware',
@@ -35,40 +35,58 @@ DRIFT_SCHEDULE = [
 
 TRUE_DRIFTS = [4000, 4500, 5000, 5500, 6000, 6500, 7000, 7500,
                8000, 8500, 9000, 9500, 10000, 10500, 11000, 11500]
+DRIFT_INTERVAL = 500
+# Part of the stream where the concept keeps changing: [4000, 12000)
+DRIFT_ZONE = (TRUE_DRIFTS[0], TRUE_DRIFTS[-1] + DRIFT_INTERVAL)
+
+STAGE_STARTS = [stage[0] for stage in DRIFT_SCHEDULE]
+
 MODEL_NAME = 'BAAI/bge-small-en-v1.5'
+MIN_TEXT_LEN = 20
+SKLEARN_SEED = 42
+
+DEFAULT_CACHE_PATH = Path(__file__).resolve().parent.parent / 'data' / 'bge_20ng_canonical.npz'
+
+FEATURE_KEYS = None
 
 
-def load_raw_20ng(seed=42):
+def _cache_meta():
+    # everything that changes the cached embeddings; a mismatch invalidates the cache
+    return f"{MODEL_NAME}|{MIN_TEXT_LEN}|{SKLEARN_SEED}|{','.join(CATEGORIES)}"
+
+
+def load_raw_20ng():
     dataset = fetch_20newsgroups(
         subset='all',
         categories=CATEGORIES,
         remove=('headers', 'footers', 'quotes'),
+        shuffle=True,
+        random_state=SKLEARN_SEED,
     )
 
-    samples = []
+    texts, topics = [], []
     for text, target_idx in zip(dataset.data, dataset.target):
         # remove extra spaces and newlines
         clean_text = ' '.join(text.split())
-        if len(clean_text) < 20:
+        if len(clean_text) < MIN_TEXT_LEN:
             continue
-        topic = dataset.target_names[target_idx].split('.')[0]
-        samples.append((clean_text, topic))
-
-    # shuffle documents with fixed seed
-    random.Random(seed).shuffle(samples)
-
-    texts = [item[0] for item in samples]
-    topics = [item[1] for item in samples]
+        texts.append(clean_text)
+        topics.append(dataset.target_names[target_idx].split('.')[0])
     return texts, topics
 
 
-def get_embeddings(cache_path='../data/bge_20ng_cache.npz', seed=42):
-    # load from cache if already computed
-    if os.path.exists(cache_path):
-        data = np.load(cache_path, allow_pickle=True)
-        return data['embeddings'], data['topics'].tolist()
+def get_canonical_embeddings(cache_path=None):
+    cache_path = Path(cache_path) if cache_path else DEFAULT_CACHE_PATH
 
-    texts, topics = load_raw_20ng(seed=seed)
+    if cache_path.exists():
+        data = np.load(cache_path)  # plain arrays only, no pickle needed
+        if 'meta' in data.files and str(data['meta']) == _cache_meta():
+            return data['embeddings'], data['topics'].tolist()
+        print(f'Cache {cache_path} does not match the current settings, recomputing.')
+
+    from sentence_transformers import SentenceTransformer
+
+    texts, topics = load_raw_20ng()
     encoder = SentenceTransformer(MODEL_NAME)
     embeddings = encoder.encode(
         texts,
@@ -77,19 +95,25 @@ def get_embeddings(cache_path='../data/bge_20ng_cache.npz', seed=42):
         normalize_embeddings=True,
     )
 
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    np.savez_compressed(cache_path, embeddings=embeddings, topics=np.array(topics))
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        embeddings=embeddings,
+        topics=np.array(topics),
+        meta=np.array(_cache_meta()),
+    )
     return embeddings, topics
+
+
+def shuffled_order(n, seed):
+    order = list(range(n))
+    random.Random(seed).shuffle(order)
+    return order
 
 
 def get_label(index, topic, mode, rng):
     # find current drift stage
-    stage = 0
-    for i in range(1, len(DRIFT_SCHEDULE)):
-        start_index = DRIFT_SCHEDULE[i][0]
-        if index >= start_index:
-            stage = i
-
+    stage = bisect.bisect_right(STAGE_STARTS, index) - 1
     start_index, width, new_rules = DRIFT_SCHEDULE[stage]
 
     # gradual drift: mix old and new rules inside the transition window
@@ -100,20 +124,32 @@ def get_label(index, topic, mode, rng):
             old_rules = DRIFT_SCHEDULE[stage - 1][2]
             if rng.random() < prob_new:
                 return new_rules[topic]
-            else:
-                return old_rules[topic]
+            return old_rules[topic]
 
     return new_rules[topic]
 
 
-def stream_generator(mode='abrupt', cache_path='../data/bge_20ng_cache.npz', seed=42):
-    embeddings, topics = get_embeddings(cache_path=cache_path, seed=seed)
+def build_labels(topics, mode, seed):
     rng = random.Random(seed)
+    return np.array([get_label(i, topic, mode, rng) for i, topic in enumerate(topics)])
 
-    for i in range(len(embeddings)):
-        vec = embeddings[i]
-        topic = topics[i]
 
-        x = {f'feature_{j}': float(val) for j, val in enumerate(vec)}
-        y = get_label(i, topic, mode, rng)
-        yield x, y
+def load_stream_arrays(mode='abrupt', seed=42, cache_path=None):
+    if mode not in ('abrupt', 'gradual'):
+        raise ValueError(f"mode must be 'abrupt' or 'gradual', got {mode!r}")
+
+    embeddings, topics = get_canonical_embeddings(cache_path)
+    order = shuffled_order(len(topics), seed)
+    embeddings = embeddings[order]
+    topics = [topics[i] for i in order]
+    labels = build_labels(topics, mode, seed)
+    return embeddings, labels, topics
+
+
+def stream_generator(mode='abrupt', seed=42, cache_path=None):
+    embeddings, labels, _ = load_stream_arrays(mode, seed, cache_path)
+    keys = [f'feature_{j}' for j in range(embeddings.shape[1])]
+
+    for vec, y in zip(embeddings, labels):
+        x = dict(zip(keys, vec.tolist()))
+        yield x, int(y)
