@@ -35,9 +35,6 @@ DRIFT_SCHEDULE = [
 
 TRUE_DRIFTS = [4000, 4500, 5000, 5500, 6000, 6500, 7000, 7500,
                8000, 8500, 9000, 9500, 10000, 10500, 11000, 11500]
-DRIFT_INTERVAL = 500
-# Part of the stream where the concept keeps changing: [4000, 12000)
-DRIFT_ZONE = (TRUE_DRIFTS[0], TRUE_DRIFTS[-1] + DRIFT_INTERVAL)
 
 STAGE_STARTS = [stage[0] for stage in DRIFT_SCHEDULE]
 
@@ -47,13 +44,9 @@ SKLEARN_SEED = 42
 
 DEFAULT_CACHE_PATH = Path(__file__).resolve().parent.parent / 'data' / 'bge_20ng_canonical.npz'
 
-FEATURE_KEYS = None
-
-
 def _cache_meta():
     # everything that changes the cached embeddings; a mismatch invalidates the cache
     return f"{MODEL_NAME}|{MIN_TEXT_LEN}|{SKLEARN_SEED}|{','.join(CATEGORIES)}"
-
 
 def load_raw_20ng():
     dataset = fetch_20newsgroups(

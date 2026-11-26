@@ -1,14 +1,11 @@
 import bisect
-from collections import Counter, deque
+from collections import deque
 
 import numpy as np
-from river import tree, metrics, drift
+from river import tree, drift
 from sklearn.metrics import f1_score
 
-from data_loader import (
-    stream_generator, load_stream_arrays,
-    TRUE_DRIFTS, DRIFT_ZONE, DRIFT_SCHEDULE,
-)
+from data_loader import stream_generator, TRUE_DRIFTS
 
 # Smaller than the 500 distance between true drifts, so the windows
 # [t, t + tolerance) never touch each other.
@@ -34,10 +31,8 @@ def _summarize(y_true, y_pred, window_size):
     rolling_sum = 0
     history = []
     eval_true, eval_pred = [], []
-    zone_correct = zone_total = 0
-    zone_start, zone_end = DRIFT_ZONE
 
-    for i, (t, p) in enumerate(zip(y_true, y_pred)):
+    for t, p in zip(y_true, y_pred):
         if p is None:
             history.append(np.nan)
             continue
@@ -50,36 +45,25 @@ def _summarize(y_true, y_pred, window_size):
 
         eval_true.append(t)
         eval_pred.append(p)
-        if zone_start <= i < zone_end:
-            zone_total += 1
-            zone_correct += ok
 
     n = len(eval_true)
     accuracy = 100.0 * sum(int(t == p) for t, p in zip(eval_true, eval_pred)) / n if n else float('nan')
     macro_f1 = 100.0 * f1_score(eval_true, eval_pred, average='macro', zero_division=0) if n else float('nan')
-    zone_accuracy = 100.0 * zone_correct / zone_total if zone_total else float('nan')
 
     return {
         'accuracy': accuracy,
         'macro_f1': macro_f1,
-        'zone_accuracy': zone_accuracy,   # only the drift zone [4000, 12000)
         'acc_history': history,           # rolling accuracy, NaN where no prediction exists
-        'n_evaluated': n,
     }
 
 
 def evaluate_stream(mode='abrupt', detector=None, seed=42, window_size=500,
-                    reset_at=None, cache_path=None):
-    reset_at = set(reset_at or [])
+                      cache_path=None):
     model = new_model()
-    river_f1 = metrics.MacroF1()  # kept only to compare with sklearn Macro-F1
 
     y_true, y_pred_all, drifts = [], [], []
 
     for i, (x, y) in enumerate(stream_generator(mode=mode, seed=seed, cache_path=cache_path)):
-        if i in reset_at:
-            model = new_model()
-
         # test-then-train
         y_pred = model.predict_one(x)
         model.learn_one(x, y)
@@ -90,7 +74,6 @@ def evaluate_stream(mode='abrupt', detector=None, seed=42, window_size=500,
         if y_pred is None:
             continue
 
-        river_f1.update(y, y_pred)
 
         if detector is not None:
             error = 0 if y_pred == y else 1
@@ -102,34 +85,7 @@ def evaluate_stream(mode='abrupt', detector=None, seed=42, window_size=500,
                 model = new_model()
 
     result = _summarize(y_true, y_pred_all, window_size)
-    result['macro_f1_river'] = river_f1.get() * 100
     result['drifts'] = drifts
-    result['y_true'] = y_true
-    result['y_pred'] = y_pred_all
-    return result
-
-
-def evaluate_majority(mode='abrupt', seed=42, window_size=500, cache_path=None):
-    _, labels, _ = load_stream_arrays(mode, seed, cache_path)
-    counts = Counter()
-    y_true, y_pred = [], []
-
-    for y in labels.tolist():
-        y_pred.append(counts.most_common(1)[0][0] if counts else None)
-        y_true.append(y)
-        counts[y] += 1
-
-    result = _summarize(y_true, y_pred, window_size)
-    result['drifts'] = []
-    result['y_true'] = y_true
-    result['y_pred'] = y_pred
-    return result
-
-
-def evaluate_oracle(mode='abrupt', seed=42, window_size=500, cache_path=None):
-    result = evaluate_stream(mode=mode, detector=None, seed=seed, window_size=window_size,
-                             reset_at=TRUE_DRIFTS, cache_path=cache_path)
-    result['drifts'] = list(TRUE_DRIFTS)
     return result
 
 
@@ -162,12 +118,3 @@ def evaluate_detection_quality(detected_drifts, true_drifts=TRUE_DRIFTS, toleran
         'outside': outside,
         'missed': [t for t in true_sorted if t not in delays],
     }
-
-
-def label_balance_by_stage(mode='abrupt', seed=42, cache_path=None):
-    _, labels, _ = load_stream_arrays(mode, seed, cache_path)
-    starts = [stage[0] for stage in DRIFT_SCHEDULE] + [len(labels)]
-    return [
-        (starts[k], starts[k + 1], float(labels[starts[k]:starts[k + 1]].mean()))
-        for k in range(len(DRIFT_SCHEDULE))
-    ]
